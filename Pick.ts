@@ -41,6 +41,7 @@ const OPUS  : Model = { label: "opus-5.5",   id: "claude-opus-5-5",   speeds: ["
 const SONNET: Model = { label: "sonnet-5.5", id: "claude-sonnet-5-5", speeds: ["slow"] };
 const HAIKU : Model = { label: "haiku-5.5",  id: "claude-haiku-5-5",  speeds: ["slow"] };
 const OPENAI: Model[] = [
+  { label: "qwen-flash-next", id: "qwen3.8-flash-next-iq3_s", speeds: ["slow"] },
   { label: "gpt-6-luna",  id: "gpt-6-luna",  speeds: ["slow", "fast"] },
   { label: "gpt-6.1-sol", id: "gpt-6.1-sol", speeds: ["slow", "fast"] },
   { label: "gpt-6-astra", id: "gpt-6-astra", speeds: ["slow", "fast", "ultrafast"] },

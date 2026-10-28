@@ -50,6 +50,9 @@ const VARS: Record<string, string> = {
   apns            : "APNS_KEY",
 };
 export const KEYS: Record<string, string> = Object.fromEntries(Object.entries(VARS).map(([name, v]) => [name, config_key(v)]));
+// Local opt-in: use the existing ChatGPT/Codex login instead of an API key.
+export const CODEX = config_get("openai_subscription", "") === "codex";
+if (CODEX) KEYS.openai = "codex-subscription";
 
 // Config
 // ======

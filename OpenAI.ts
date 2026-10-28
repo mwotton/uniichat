@@ -12,12 +12,14 @@ import type { Ask, Img } from "./AskAI.ts";
 import { Agent, type Emit, type Entry, type Item, type Step, type Tool, type Use, type Wire } from "./Agent.ts";
 import { Price, type Usage } from "./Price.ts";
 import * as config from "./Config.ts";
+import { CODEX_URL, codex_body, codex_headers } from "./Codex.ts";
+import { QWEN_MODEL, qwen_body } from "./Qwen.ts";
 
 // Types
 // =====
 
 // a stream read so far: the final response, or an error event; usage
-type State = { res: any; error: any; use: Usage };
+type State = { res: any; error: any; use: Usage; items: Map<number, any> };
 
 // Constants
 // =========
@@ -83,6 +85,10 @@ export namespace OpenAI {
   // one stream event; whether it is the last
   export function read(st: State, ev: any, on: Emit): boolean {
     switch (ev.type) {
+      case "response.output_item.done": {
+        st.items.set(ev.output_index, ev.item);
+        return false;
+      }
       case "response.output_text.delta": {
         on("unii", ev.delta);
         return false;
@@ -109,7 +115,12 @@ export namespace OpenAI {
       case "response.incomplete":
       case "response.failed": {
         st.res = ev.response;
-        OpenAI.usage(st.use, ev.response);
+        // Codex can leave the completed response's output empty; completed
+        // items are still sent separately, including tool calls and reasoning.
+        if (!st.res.output?.length && st.items.size) {
+          st.res = { ...st.res, output: [...st.items].sort(([a], [b]) => a - b).map(([, item]) => item) };
+        }
+        OpenAI.usage(st.use, st.res);
         return true;
       }
       case "error": {
@@ -216,11 +227,19 @@ export namespace OpenAI {
   export const wire: Wire<State> = {
     key     : "openai",
     idle    : 1200e3,
-    url     : "https://api.openai.com/v1/responses",
-    headers : (key) => ({ authorization: "Bearer " + key, "content-type": "application/json" }),
-    body    : OpenAI.body,
+    url     : (ask) => ask.model === QWEN_MODEL
+      ? config.config_get("qwen_url", "http://127.0.0.1:18080/v1/responses")
+      : config.CODEX ? CODEX_URL : "https://api.openai.com/v1/responses",
+    headers : (key, ask) => ask.model === QWEN_MODEL
+      ? { "content-type": "application/json" }
+      : config.CODEX ? codex_headers() : ({ authorization: "Bearer " + key, "content-type": "application/json" }),
+    body    : (ask, items, tools, max) => {
+      const body = OpenAI.body(ask, items, tools, max);
+      if (ask.model === QWEN_MODEL) return qwen_body(body);
+      return config.CODEX ? codex_body(body) : body;
+    },
     count   : async () => null,
-    start   : (ask) => ({ res: null, error: null, use: Price.usage(ask.speed) }),
+    start   : (ask) => ({ res: null, error: null, use: Price.usage(ask.speed), items: new Map() }),
     read    : OpenAI.read,
     begun   : (ev) => ev.type === "response.output_item.added",
     step    : OpenAI.step,

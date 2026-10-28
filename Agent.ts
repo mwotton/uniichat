@@ -96,8 +96,8 @@ export type Emit = (kind: Kind, text: string, fresh?: boolean) => void;
 export type Wire<S> = {
   key     : string;
   idle    : number;
-  url     : string;
-  headers : (key: string, ask: Ask) => Record<string, string>;
+  url     : string | ((ask: Ask) => string);
+  headers : (key: string, ask: Ask) => Record<string, string> | Promise<Record<string, string>>;
   body    : (ask: Ask, items: Item[], tools: Tool[], max: number) => unknown;
   count   : (key: string, ask: Ask, body: unknown) => Promise<number | null>;
   start   : (ask: Ask) => S;
@@ -362,9 +362,9 @@ export namespace Agent {
     let res: Response | null = null;
     let step: Step;
     try {
-      res = await fetch(wire.url, {
+      res = await fetch(typeof wire.url === "function" ? wire.url(run.ask) : wire.url, {
         method  : "POST",
-        headers : wire.headers(key, run.ask),
+        headers : await wire.headers(key, run.ask),
         body    : json,
         signal  : run.ask.bill ? idle.signal : AbortSignal.any([run.abort.signal, idle.signal]),
         timeout : false,
