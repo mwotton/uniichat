@@ -23,6 +23,8 @@
 // there anew).
 
 import * as fs from "node:fs";
+import { ContextView } from "./ContextView.ts";
+import type { Frame } from "./Context.ts";
 import { AskAI, type Ask, type Bill, type Block, type Call, type Event, type Kind, type Pay } from "./AskAI.ts";
 import type { Out } from "./Agent.ts";
 import { report_text } from "./Call.ts";
@@ -77,6 +79,7 @@ export type Moved = {
 // what the server does for agents (report: work stopped stays unanswered;
 // pick: the chat's pick; halt: what stops its turn)
 type Hooks = {
+  flush? : () => Promise<unknown>;
   push   : (agent: Agent, kind: Kind, text: string) => void;
   on     : (agent: Agent, ev: Event) => void;
   report : (agent: Agent, text: string, stopped: boolean) => void;
@@ -113,6 +116,7 @@ const CHATS = new Map<string, Tools>();
 const GONE  = new Map<string, string>();
 let COMING: Promise<void> = Promise.resolve();
 let HTTP: ReturnType<typeof Bun.serve> | null = null;
+const CONTEXTS = new WeakMap<Tools, Map<string, Memory>>();
 
 // the header of a request that waits on a job, its id (Tools.give)
 const JOB = "x-unii-job";
@@ -193,7 +197,7 @@ const SUB = SUB_HEAD + "\n\n" + VIEW_DOC + "\n\n" + DEVICES;
 // device (`kit`: Machine.ts's), and the master's computer tasks (HAND),
 // whose agents get only COMPUTER, on their device
 const OWN: Spec[] = [
-  spec("zoom", "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. With an agent's name as id, give that agent's whole chat. A long text comes in pages from character at, saying where to go on.", { id: { type: ["integer", "string"] }, n: INT, at: INT }, ["id"]),
+  spec("zoom", "Open the line id+n of the view into the two lines of n/2 under it; n = 1 gives the message whole. scope=task opens your own task_history after a context rebuild; the default scope=chat opens the shared chat. With an agent's name as id, give that agent's whole chat. A long text comes in pages from character at, saying where to go on.", { id: { type: ["integer", "string"] }, n: INT, at: INT, scope: { type: "string", enum: ["chat", "task"] } }, ["id"]),
   spec("date", "The date and time of message id.", { id: INT }, ["id"]),
 ];
 const BOSS: Spec[] = [
@@ -237,6 +241,8 @@ export namespace Tools {
   }
 
   export function close(tools: Tools): void {
+    CONTEXTS.get(tools)?.forEach((mem) => Memory.stop(mem));
+    CONTEXTS.delete(tools);
     Tools.stop(tools, null);
     CHATS.delete(tools.key);
   }
@@ -312,6 +318,12 @@ export namespace Tools {
   // null: no such method
   export async function answer(tools: Tools, who: string, method: string, params: any, signal: AbortSignal, id: string): Promise<object | null> {
     switch (method) {
+      case "context/rebuild": {
+        if (!Number.isSafeInteger(params.from) || params.from < 0 || !Number.isSafeInteger(params.target) || params.target < 1) {
+          throw new Error("Invalid context rebuild bounds");
+        }
+        return Tools.context(tools, who, params.from, params.target, signal);
+      }
       case "initialize": {
         const protocolVersion = params.protocolVersion ?? "2025-06-18";
         return { protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "unii", version: "1" } };
@@ -333,11 +345,58 @@ export namespace Tools {
     return null;
   }
 
+  // This internal RPC follows Tools.pass across worker moves. Flush entry
+  // writes before choosing a snapshot, then hold that exact end across awaits.
+  export async function context(tools: Tools, who: string, from: number, target: number, signal: AbortSignal): Promise<Frame> {
+    await tools.hooks.flush?.();
+    let mem = tools.mem;
+    let through = mem.count;
+    if (who !== "main") {
+      const agent = Tools.agent(tools, who);
+      if (agent === null) throw new Error("No agent " + who);
+      const log = Memory.agent(tools.mem, who) ?? [];
+      through = log.length;
+      const cached = CONTEXTS.get(tools) ?? new Map<string, Memory>();
+      CONTEXTS.set(tools, cached);
+      let own = cached.get(who);
+      if (!own) {
+        // Summaries are a reusable cache beside the durable original agent log.
+        own = Memory.load(tools.mem.dir + "/docs/agent/" + who + ".memory", tools.mem.share);
+        own.pay = tools.mem.pay;
+        cached.set(who, own);
+      }
+      mem = own;
+      const last = Memory.message(mem, mem.count - 1);
+      const indexed = last?.act === undefined ? 0 : Number(last.act) + 1;
+      for (let i = indexed; i < log.length; i++) {
+        Memory.push(mem, [{ kind: log[i].kind, text: log[i].text, act: String(i) }]);
+      }
+      Memory.pump(mem);
+    }
+    const agent = who === "main" ? null : Tools.agent(tools, who);
+    const inherited = agent?.view.map((b) => b.text).join("") ?? "";
+    const ends = [...inherited.matchAll(/(?:^|\n)(\d+)\+(\d+)\|/g)].map((m) => Number(m[1]) + Number(m[2]));
+    const mainEnd = Math.min(tools.mem.count, Math.max(0, ...ends));
+    const shared = mainEnd > 0 ? await ContextView.build(tools.mem, mainEnd, mainEnd, Math.floor(target / 4), signal) : null;
+    const frame = await ContextView.build(mem, from, mem.count, shared ? Math.floor(target * 0.75) : target, signal, who === "main" ? "chat" : "task");
+    if (shared) {
+      frame.blocks.unshift(...shared.blocks.slice(0, 1));
+      frame.imgs = [...shared.imgs ?? [], ...frame.imgs ?? []];
+    }
+    frame.through = through;
+    frame.blocks.push(Tools.devices(tools));
+    if (who === "main") {
+      frame.blocks.push(Tools.at_work(tools));
+      if (tools.mem.goal !== null) frame.blocks.push({ text: "Active goal: " + tools.mem.goal + "\n", mark: false });
+    }
+    return frame;
+  }
+
   export function list(tools: Tools, who: string): Spec[] {
     if (who === "main") {
       return [...OWN, ...BOSS, ...kit(who), HAND];
     }
-    return tools.agents.get(who)?.role.$ === "hands" ? [COMPUTER] : [...OWN, ...kit(who)];
+    return tools.agents.get(who)?.role.$ === "hands" ? [...OWN, COMPUTER] : [...OWN, ...kit(who)];
   }
 
   // id: a job's, if it starts one
@@ -351,8 +410,10 @@ export namespace Tools {
         if (/^[A-Za-z]/.test(id)) {
           return { text: clip_page(Memory.agent_show(mem, id), at), fail: false };
         }
-        const imgs = n === 1 && at === 0 ? Memory.images(mem, Number(id)) : [];
-        return { text: Memory.zoom(mem, Number(id), n, at), fail: false, imgs };
+        const history = args.scope === "task" ? CONTEXTS.get(tools)?.get(who) : mem;
+        if (!history) return { text: "No task memory has been built yet.", fail: true };
+        const imgs = n === 1 && at === 0 ? Memory.images(history, Number(id)) : [];
+        return { text: Memory.zoom(history, Number(id), n, at), fail: false, imgs };
       }
       case "date": {
         return { text: Memory.date(mem, Number(args.id)), fail: false };
@@ -513,8 +574,9 @@ export namespace Tools {
       return "No agent " + name + " to tell.";
     }
     if (agent.call !== null) {
+      const at = (Memory.agent(tools.mem, name) ?? []).length;
       tools.hooks.push(agent, "user", message);
-      agent.call.send({ text: message, imgs: [] });
+      agent.call.send({ text: message, imgs: [], at });
       return "Sent. " + name + " reads it between its tool calls, and its report answers it.";
     }
     const busy = agent.role.$ === "hands" ? Tools.screen(tools, agent.role.device) : null;
@@ -589,11 +651,11 @@ export namespace Tools {
         const system = Tools.system(SUB);
         const blocks = [...agent.view, Tools.devices(tools), log];
         const effort = role.effort ?? run.effort;
-        return { ...run, effort, system, blocks, searches: SEARCHES, server, bill };
+        return { ...run, effort, system, blocks, searches: SEARCHES, server, bill, context: { from: 0 } };
       }
       case "hands": {
         const system = Tools.system(HANDS.replace("{device}", role.device));
-        return { ...run, system, blocks: [...agent.view, log], searches: 0, server, bill };
+        return { ...run, system, blocks: [...agent.view, log], searches: 0, server, bill, context: { from: 0 } };
       }
     }
   }

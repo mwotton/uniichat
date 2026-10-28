@@ -44,7 +44,7 @@ export type Vendor = "claude-api" | "openai-api";
 export type Img = { type: string; data: string };
 
 // a message for the agent
-export type Say = { text: string; imgs: Img[] };
+export type Say = { text: string; imgs: Img[]; at?: number };
 
 // a text block of a call's message; `mark`: a cache entry ends after it
 export type Block = { text: string; mark: boolean };
@@ -92,6 +92,9 @@ export type Ask = Pick & {
   bill?     : Bill;
   patient?  : boolean;
   yields?   : string;
+  // Starting log record of this task. Rebuilds use the owning tools server,
+  // so the context follows a chat that moves between workers.
+  context?  : { from: number };
 };
 
 // a prefix cached: until when; while its leader's response has not

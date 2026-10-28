@@ -1,6 +1,25 @@
 UniiChat
 ========
 
+This is Lambda Mechanic's fork of VictorTaelin/UniiChat. It adds automatic
+context rebuilding, configurable per-model budgets, a local Strata Qwen
+adapter, and an opt-in Codex subscription adapter. The upstream memory tree,
+original transcripts and Apache-2.0 license are retained.
+
+Before each model request, including tool continuations, the fork checks the
+whole input against a budget with output space reserved. Near the limit it
+uses the vendor's token counter where available. Otherwise it conservatively
+estimates one token per UTF-8 byte, with a separate image allowance. This can
+rebuild earlier than necessary, especially for English text and code.
+
+When necessary, it resumes from a smaller tree view and recent author-tagged
+verbatim records. Current user instructions stay verbatim; completed tools
+are read from their logs. Explicit overflow errors get at most two smaller
+recovery requests. Authentication and quota errors are not context retries.
+Subagents maintain their own summary trees and can retrieve their originals
+with `zoom(..., scope: "task")`. See [CONTEXT.md](CONTEXT.md) for configuration,
+behavior and limitations.
+
 [▶ Watch the announcement video](https://x.com/VictorTaelin/status/2108200878553588091)
 
 **This repo is vibe-coded.** AI agents wrote nearly all of it, and AI
@@ -89,6 +108,12 @@ also be set as the variable `UNII_<KEY>`:
   ~/.unii/work).
 - `rules`: a file appended to every system prompt.
 - `after`: a shell command run after each turn.
+- `context_limits`: an object keyed by provider model ID, overriding `context`,
+  `output` and `margin` token budgets. `UNII_CONTEXT_LIMITS` accepts the same
+  object as JSON. These are operating budgets; see CONTEXT.md for defaults.
+- `openai_subscription`: set to `codex` to use an existing Codex login instead
+  of an API key. The adapter reads the official login file and delegates token
+  refresh to `codex app-server`.
 - `workers`: how many processes serve the users (default none: one
   process). With a number, `Server.ts` only routes, behind a proxy that
   honors its `x-unii-worker` header (Server.ts explains).

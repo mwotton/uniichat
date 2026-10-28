@@ -279,6 +279,7 @@ export namespace Chat {
     const dir = config.DIR + "/users/" + user.id;
     const mem = Memory.load(dir, () => Chat.share(chat), (id, ans) => Cloud.act_put(acct, id, ans));
     const tools = Tools.serve(mem, {
+      flush : () => chat.writes,
       push   : (agent, kind, text) => Chat.push(chat, agent, kind, text),
       on     : (agent, ev) => Chat.on(chat, agent, ev),
       report : (agent, text, stopped) => Chat.report(chat, agent, text, stopped),
@@ -551,7 +552,7 @@ export namespace Chat {
     chat.socks.forEach((sock) => Chat.show(chat, sock));
     const bill = mem.pay?.("chat", String(msgs[0].id));
     const blocks = [...view, Tools.devices(chat.tools), Tools.at_work(chat.tools), { text: HEAD + text, mark: true }];
-    const ask = { ...Chat.share(chat), searches: SEARCHES, server, blocks, imgs, bill };
+    const ask = { ...Chat.share(chat), searches: SEARCHES, server, blocks, imgs, bill, context: { from: msgs[0].id } };
     chat.model = chat.pick.model;
     chat.asked = true;
     chat.open = 0;

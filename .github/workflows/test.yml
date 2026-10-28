@@ -1,0 +1,19 @@
+name: test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun test --isolate --timeout 15000
+        env:
+          TMPDIR: ${{ runner.temp }}
+      - run: bun run web

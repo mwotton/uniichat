@@ -14,6 +14,7 @@ import { Price, type Usage } from "./Price.ts";
 import * as config from "./Config.ts";
 import { CODEX_URL, codex_body, codex_headers } from "./Codex.ts";
 import { QWEN_MODEL, qwen_body } from "./Qwen.ts";
+import { Context } from "./Context.ts";
 
 // Types
 // =====
@@ -169,7 +170,8 @@ export namespace OpenAI {
     const refusals = out.flatMap((o) => (o.type === "message" ? o.content : [])).filter((c: any) => c.type === "refusal");
     const step: Step = { out, uses, entries: out.flatMap(OpenAI.entries), stop: "done", why: "", note };
     if (res.status === "failed") {
-      return { ...step, stop: res.error?.code === "server_error" ? "busy" : "fail", why: res.error?.message ?? "failed" };
+      const why = (res.error?.code ?? "") + ": " + (res.error?.message ?? "failed");
+      return { ...step, stop: Context.overflow(why) ? "context" : res.error?.code === "server_error" ? "busy" : "fail", why };
     }
     if (res.status === "incomplete") {
       return { ...step, stop: "fail", why: "incomplete: " + res.incomplete_details?.reason };

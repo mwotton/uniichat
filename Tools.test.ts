@@ -15,7 +15,7 @@ const { Tools } = await import("./Tools.ts");
 
 test("a call's MCP requests follow its chat past a process that ended", async () => {
   const tools = Tools.serve({} as any, {} as any);
-  const ask = () => fetch(Tools.at(tools, "main"), { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
+  const ask = (method = "tools/list") => fetch(Tools.at(tools, "main"), { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method }) });
   // B: took the chat, then gave it on and ended
   const b = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("b") });
   const at_b = "http://127.0.0.1:" + b.port + "/";
@@ -27,5 +27,6 @@ test("a call's MCP requests follow its chat past a process that ended", async ()
   const c = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => new Response("c " + new URL(req.url).pathname) });
   Tools.went(tools.key, "http://127.0.0.1:" + c.port + "/");
   expect(await (await ask()).text()).toBe("c /" + tools.key + "/main");
+  expect(await (await ask("context/rebuild")).text()).toBe("c /" + tools.key + "/main");
   c.stop(true);
 });

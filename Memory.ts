@@ -475,7 +475,7 @@ export namespace Memory {
   export function say(mem: Memory, a: number, b: number): Say {
     const ids = Array.from({ length: b - a }, (_, k) => a + k);
     const text = ids.map((id) => Memory.message(mem, id)!.text).join("");
-    return { text, imgs: ids.flatMap((id) => Memory.images(mem, id)) };
+    return { text, imgs: ids.flatMap((id) => Memory.images(mem, id)), at: a };
   }
 
   // Images

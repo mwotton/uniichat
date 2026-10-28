@@ -38,6 +38,7 @@ import { Price, type Usage } from "./Price.ts";
 import { live_push } from "./View.ts";
 import { Machine, type Spec } from "./Machine.ts";
 import * as config from "./Config.ts";
+import { Context, type Frame } from "./Context.ts";
 
 // Types
 // =====
@@ -57,6 +58,7 @@ type Run = {
   sent  : Say[];
   abort : AbortController;
   end   : End;
+  latest?: Img[]; // latest tool images are not stored by the upstream text log
 };
 
 export type Back = { id: string; out: Out };
@@ -83,7 +85,7 @@ export type Step = {
   out     : unknown[];
   uses    : Use[];
   entries : Entry[];
-  stop    : "done" | "tools" | "again" | "busy" | "down" | "lost" | "fail";
+  stop    : "done" | "tools" | "again" | "busy" | "down" | "lost" | "fail" | "context";
   why     : string;
   note    : string;
 };
@@ -174,8 +176,38 @@ export namespace Agent {
     const tools = await Agent.server(run);
     const parts = ask.blocks.filter((b) => b.text !== "");
     const items: Item[] = [{ $: "User", parts, imgs: ask.imgs ?? [] }];
+    const limits = Context.limits(ask.model);
+    const budget = limits.context - limits.output - limits.margin;
+    const overhead = Context.estimate(wire.body(ask, [], tools, limits.output));
+    let recoveries = 0;
     while (!signal.aborted) {
+      let size = Context.estimate(wire.body(ask, items, tools, limits.output));
+      if (size > budget * 0.9) {
+        const counted = await wire.count(key, ask, wire.body(ask, items, tools, limits.output));
+        size = counted ?? size;
+      }
+      if (signal.aborted) return;
+      if (size > budget) {
+        if (!await Agent.rebuild(run, items, Math.max(1, Math.floor((budget - overhead) * 0.65)), size, "budget")) return;
+        size = Context.estimate(wire.body(ask, items, tools, limits.output));
+        const counted = await wire.count(key, ask, wire.body(ask, items, tools, limits.output));
+        if (signal.aborted) return;
+        if ((counted ?? size) > budget) {
+          end.text = "The current task, recent messages, images and tool definitions exceed the context budget even after rebuilding. Send a smaller request or increase the configured context limit.";
+          end.stop = "lost";
+          return;
+        }
+      }
       const step = await Agent.step(wire, run, key, (max) => wire.body(ask, items, tools, max), items);
+      if (step.stop === "context") {
+        if (++recoveries > 2 || !await Agent.rebuild(run, items, Math.max(1, Math.floor(Math.min(size * 0.6 ** recoveries, (budget - overhead) * 0.6))), size, "overflow")) {
+          end.text ||= "The model's context limit is still exceeded after bounded recovery. Send a smaller request or correct the model's context limits.";
+          end.stop = "lost";
+          return;
+        }
+        continue;
+      }
+      recoveries = 0;
       for (const entry of step.entries) {
         on({ $: "Entry", ...entry });
       }
@@ -195,6 +227,7 @@ export namespace Agent {
           return;
         }
         const out = await Agent.use(run, tools, use);
+        if (out.imgs?.length) run.latest = out.imgs;
         on({ $: "Entry", kind: "echo", text: (out.fail ? "error: " : "") + out.text, of: use.id });
         backs.push({ id: use.id, out });
       }
@@ -223,13 +256,56 @@ export namespace Agent {
     }
   }
 
+  // Only reached before a model request, after all preceding tools completed.
+  // The frame contains author-tagged, verbatim recent records rather than
+  // partial native tool sequences. Clearing ALL native items avoids dangling
+  // calls/reasoning and never re-executes a tool.
+  export async function rebuild(run: Run, items: Item[], target: number, before: number, reason: string): Promise<boolean> {
+    if (!run.ask.context || !run.ask.server) {
+      run.end.text = "The request exceeds the context budget and has no durable history to rebuild from.";
+      run.end.stop = "lost";
+      return false;
+    }
+    run.on({ $: "Entry", kind: "mind", text: "Rebuilding context from memory; completed tools will not run again." });
+    const signal = AbortSignal.any([run.abort.signal, AbortSignal.timeout(30000)]);
+    try {
+      const frame: Frame = await Agent.rpc(run, "context/rebuild", { ...run.ask.context, target }, signal);
+      if (run.abort.signal.aborted) return false;
+      if (run.latest?.length) {
+        const images = new Map([...frame.imgs ?? [], ...run.latest].map((img) => [img.type + ":" + Bun.hash(img.data), img]));
+        frame.imgs = [...images.values()];
+        frame.blocks.push({ text: "The attached tool images are from the most recent completed image-producing tool call.\n", mark: false });
+      }
+      const next: Item[] = [{ $: "User", parts: frame.blocks, imgs: frame.imgs ?? [] }];
+      const after = Context.estimate(next);
+      const historyBefore = Context.estimate(items);
+      if (after >= historyBefore) {
+        run.end.text = "Context cannot shrink further without dropping the current task or unsummarized messages. Allow summaries to finish, send a smaller request, or increase the context limit.";
+        run.end.stop = "lost";
+        return false;
+      }
+      items.splice(0, items.length, ...next);
+      run.ask.blocks = frame.blocks;
+      run.ask.imgs = frame.imgs;
+      // A post logged during the rebuild is either in this exact snapshot
+      // (so do not append it twice) or remains queued for the next tool step.
+      run.sent = run.sent.filter((say) => say.at === undefined || say.at >= frame.through);
+      console.info("context: " + JSON.stringify({ model: run.ask.model, reason, requestBefore: before, historyBefore, historyAfter: after, target, through: frame.through }));
+      return true;
+    } catch (err: any) {
+      run.end.text = run.abort.signal.aborted ? "stopped" : "Could not rebuild context: " + err.message;
+      run.end.stop = "lost";
+      return false;
+    }
+  }
+
   // make: the request's body, writing `max` tokens at most. Asking again,
   // it holds its room (Room): its model's, or its import's, which one
   // request holds at a time while the rest wait on it, so each import
   // has one request at a busy model however many it runs, and imports
   // share its room alike
   export async function step<S>(wire: Wire<S>, run: Run, key: string, make: (max: number) => unknown, items: Item[]): Promise<Step> {
-    const body = make(MAX);
+    const body = make(Context.limits(run.ask.model).output);
     const cost = Agent.worst(run.ask, JSON.stringify(body), items, () => wire.count(key, run.ask, body));
     const signal = run.abort.signal;
     const model = run.ask.model;
@@ -339,7 +415,8 @@ export namespace Agent {
   // whether the call stops or not, and billed: its response, if any, and
   // step
   export async function request<S>(wire: Wire<S>, run: Run, key: string, make: (max: number) => unknown, cost: Cost, seen: Entry[]): Promise<{ res: Response | null; step: Step }> {
-    const grant = run.ask.bill ? await run.ask.bill(cost, MAX) : FREE;
+    const cap = Context.limits(run.ask.model).output;
+    const grant = run.ask.bill ? await run.ask.bill(cost, cap) : { ...FREE, max: cap };
     if (typeof grant === "string") {
       return { res: null, step: Agent.fail(grant, []) };
     }
@@ -370,7 +447,7 @@ export namespace Agent {
         timeout : false,
       } as RequestInit);
       const why = res.ok && res.body ? "" : "HTTP " + res.status + ": " + Agent.reason(await res.text());
-      step = why ? Agent.fail(why, [], Agent.passing(res) ? "busy" : "down") : await Agent.stream(wire, run, res.body!, timer, seen, st, flight.begun, read);
+      step = why ? Agent.fail(why, [], [400, 413].includes(res.status) && Context.overflow(why) ? "context" : Agent.passing(res) ? "busy" : "down") : await Agent.stream(wire, run, res.body!, timer, seen, st, flight.begun, read);
     } catch (err: any) {
       step = Agent.fail(err.message, [], "busy");
     }
@@ -432,6 +509,9 @@ export namespace Agent {
         if (wire.read(st, ev, on)) {
           read.done = true;
           const step = wire.step(st, ask);
+          if (Context.overflow(step.why) && ["fail", "busy", "down", "context"].includes(step.stop)) {
+            return Agent.fail(step.why, [], "context");
+          }
           return step.stop === "fail" || step.stop === "busy" ? Agent.fail(step.why, seen, step.stop) : step;
         }
       }
@@ -498,12 +578,12 @@ export namespace Agent {
     return { text: AskAI.show(res.content), fail: res.isError === true, imgs };
   }
 
-  export async function rpc(run: Run, method: string, params: unknown): Promise<any> {
+  export async function rpc(run: Run, method: string, params: unknown, signal = run.abort.signal): Promise<any> {
     const res = await fetch(run.ask.server, {
       method  : "POST",
       headers : { "content-type": "application/json" },
       body    : JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-      signal  : run.abort.signal,
+      signal,
       timeout : false,
     } as RequestInit);
     const msg = await res.json();
